@@ -1,0 +1,156 @@
+name: Sync upstream (yijixiuxin/chanlun-pro)
+
+# 每周一自动跟上上游
+#
+# 注意：本仓库 432 MB（含 95 MB Pyarmor 密文），
+#       merge 会比普通仓库慢，所以 timeout 设 30 分钟。
+#
+# 上游没有任何 workflow，所以不存在 workflow 冲突问题。
+
+on:
+  schedule:
+    # 每周一 02:30 UTC = 北京时间 10:30（错开 czsc 的 02:00）
+    - cron: '30 2 * * 1'
+  workflow_dispatch:
+    inputs:
+      sync_tags:
+        description: '同时同步上游 tag'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Merge upstream
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v5
+        with:
+          ref: master
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # 大仓库合并，放宽 gc 与打包参数
+          git config gc.auto 0
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/yijixiuxin/chanlun-pro.git 2>/dev/null || true
+          git fetch upstream master --force
+          if [ "${{ inputs.sync_tags }}" != "false" ]; then
+            git fetch upstream --tags --force || true
+          fi
+
+      - name: Detect drift
+        id: drift
+        run: |
+          LOCAL=$(git rev-parse HEAD)
+          REMOTE=$(git rev-parse upstream/master)
+          echo "local  = $LOCAL"
+          echo "remote = $REMOTE"
+
+          if [ "$LOCAL" = "$REMOTE" ]; then
+            echo "behind=false" >> "$GITHUB_OUTPUT"
+            echo "已是最新"
+          else
+            BEHIND=$(git rev-list --count HEAD..upstream/master)
+            AHEAD=$(git rev-list --count upstream/master..HEAD)
+            echo "behind=true" >> "$GITHUB_OUTPUT"
+            echo "behind_count=$BEHIND" >> "$GITHUB_OUTPUT"
+            echo "ahead_count=$AHEAD"  >> "$GITHUB_OUTPUT"
+            echo "上游有 $BEHIND 个新提交，本地领先 $AHEAD 个"
+          fi
+
+      - name: Merge upstream/master
+        id: merge
+        if: steps.drift.outputs.behind == 'true'
+        run: |
+          if git merge --no-edit upstream/master; then
+            echo "result=ok" >> "$GITHUB_OUTPUT"
+            echo "merge 成功"
+          else
+            echo "result=conflict" >> "$GITHUB_OUTPUT"
+            git merge --abort || true
+            echo "merge 冲突，已回滚"
+          fi
+
+      - name: Push
+        if: steps.drift.outputs.behind == 'true' && steps.merge.outputs.result == 'ok'
+        run: |
+          git push origin master
+          if [ "${{ inputs.sync_tags }}" != "false" ]; then
+            git push origin --tags --force-with-lease || git push origin --tags || true
+          fi
+
+      - name: Open issue on conflict
+        if: steps.merge.outputs.result == 'conflict'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const title = `上游同步冲突 ${new Date().toISOString().slice(0,10)}`;
+            const body = [
+              '## 自动同步遇到冲突，已回滚，fork 未变更',
+              '',
+              `上游 \`yijixiuxin/chanlun-pro\` 有 **${process.env.BEHIND}** 个新提交，\`git merge\` 失败。`,
+              '',
+              '### 处理步骤',
+              '```bash',
+              'git clone https://github.com/' + process.env.REPO + '.git',
+              'cd chanlun-pro',
+              'git remote add upstream https://github.com/yijixiuxin/chanlun-pro.git 2>/dev/null || true',
+              'git fetch upstream',
+              'git merge upstream/master',
+              '# 解决冲突后',
+              'git push origin master',
+              '```',
+              '',
+              '> 本仓库较大（432 MB），clone 时建议加 `--depth 1` 先看，',
+              '> 需要完整历史再 `git fetch --unshallow`。',
+            ].join('\n');
+
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'open', labels: 'upstream-sync'
+            });
+            if (existing.data.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: existing.data[0].number,
+                body: `再次冲突 @ ${new Date().toISOString()}`
+              });
+              return;
+            }
+            await github.rest.issues.create({
+              owner: context.repo.owner, repo: context.repo.repo,
+              title, body, labels: ['upstream-sync']
+            });
+        env:
+          BEHIND: ${{ steps.drift.outputs.behind_count }}
+          REPO: ${{ github.repository }}
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### 同步结果"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 上游新提交 | ${{ steps.drift.outputs.behind_count || '0' }} |"
+            echo "| 本地领先 | ${{ steps.drift.outputs.ahead_count || '0' }} |"
+            echo "| merge 结果 | ${{ steps.merge.outputs.result || 'n/a' }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
